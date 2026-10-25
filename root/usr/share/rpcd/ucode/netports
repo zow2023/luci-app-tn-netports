@@ -91,12 +91,16 @@ const type_patterns = {
 };
 
 function type_autodetect(ifname) {
+	/* SFP 优先：检查 modalias 是否含 sfp */
+	const modalias = sysfs_net_read(ifname, 'device/modalias');
+	if (modalias && match(modalias, /sfp/i))
+		return 'sfp';
+
 	for (let t in type_patterns)
 		for (let re in type_patterns[t])
 			if (match(ifname, re))
 				return t;
 
-	/* default type is 'copper' */
 	return 'copper';
 }
 
@@ -317,7 +321,7 @@ const methods = {
 					if (speed <= 0) {
 						speed = int(sysfs_net_read(ifname, 'speed')) ?? 0;
 
-						if (speed < 0)
+						if (speed < 0 || speed > 100000)
 							speed = 0;
 					}
 				}

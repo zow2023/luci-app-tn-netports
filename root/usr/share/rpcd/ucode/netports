@@ -82,7 +82,7 @@ function sysfs_net_read_bridge(ifname) {
 }
 
 const type_patterns = {
-	copper:    [ /^eth\d+/, /^en[a-z]\d+[a-z]\d+/, /^sw\d+p\d+/ ],
+	copper:    [ /^eth\d+/, /^en[a-z]\d+[a-z]\d+/, /^sw\d+p\d+/, /^lan\d+/, /^wan$/ ],
 	usb_rndis: [ /^usb\d+/ ],
 	usb_stick: [ /^wwan\d+/, /^ww[a-z]\d+[a-z]\d+/ ],
 	ppp:       [ /^ppp\d+/ ],

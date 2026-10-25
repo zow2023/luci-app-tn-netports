@@ -308,7 +308,7 @@ const methods = {
 						if (type(dev_state.link_duplex) == 'bool')
 							duplex = dev_state.link_duplex ? 'full' : 'half';
 
-						if (dev_state.link_speed > 0)
+						if (dev_state.link_speed > 0 && dev_state.link_speed < 100000)
 							speed = dev_state.link_speed;
 					}
 
@@ -320,7 +320,6 @@ const methods = {
 
 					if (speed <= 0) {
 						speed = int(sysfs_net_read(ifname, 'speed')) ?? 0;
-
 						if (speed < 0 || speed > 100000)
 							speed = 0;
 					}

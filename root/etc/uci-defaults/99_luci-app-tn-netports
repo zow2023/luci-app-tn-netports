@@ -1,0 +1,32 @@
+#!/bin/sh
+# luci-app-tn-netports uci-defaults
+# Populate the initial port list from /etc/board.json when no user
+# ports are configured. Handles both DSA (network.lan.ports arrays)
+# and legacy (network.*.device) board.json layouts.
+
+count=$(uci -q show luci_netports 2>/dev/null | grep -c "=port")
+[ "$(uci -q get luci_netports.@port[0].ifname)" = "lo" ] && count=$((count - 1))
+
+if [ "${count:-0}" -le 0 ]; then
+	add_port() {
+		local dev="$1"
+		[ -n "$dev" ] || return
+		[ -e "/sys/class/net/$dev" ] || return
+		uci -q show luci_netports | grep -q "ifname='$dev'" && return
+		local sid
+		sid=$(uci add luci_netports port)
+		uci set luci_netports.${sid}.ifname="$dev"
+	}
+
+	for dev in $(jsonfilter -q -i /etc/board.json \
+		-e '$.network.lan.ports[*]' \
+		-e '$.network.wan.ports[*]' \
+		-e '$.network.lan.device' \
+		-e '$.network.wan.device' 2>/dev/null); do
+		add_port "$dev"
+	done
+
+	uci commit luci_netports
+fi
+
+exit 0

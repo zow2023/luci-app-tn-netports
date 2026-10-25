@@ -1,0 +1,364 @@
+// luci-app-tn-netports - rpcd ucode plugin
+// Collects network port status for the LuCI "Network Interfaces Ports Status"
+// panel. Replaces the legacy Lua rpcd script (OpenWrt 25.12: ucode rpcd).
+//
+// Copyright (c) 2018-2019, Tano Systems. All Rights Reserved.
+// Anton Kikin <a.kikin@tano-systems.com>
+// OpenWrt 25.12 ucode adaptation, 2026.
+
+'use strict';
+
+import { access, readfile, open, readlink, basename } from 'fs';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+
+const sysfs_net_root = '/sys/class/net';
+
+function sysfs_net_read(ifname, file) {
+	const v = readfile(`${sysfs_net_root}/${ifname}/${file}`);
+
+	if (v == null)
+		return '';
+
+	return trim(v);
+}
+
+function sysfs_net_read_stats(ifname) {
+	return {
+		tx_bytes:   int(sysfs_net_read(ifname, 'statistics/tx_bytes')) ?? 0,
+		tx_packets: int(sysfs_net_read(ifname, 'statistics/tx_packets')) ?? 0,
+		rx_bytes:   int(sysfs_net_read(ifname, 'statistics/rx_bytes')) ?? 0,
+		rx_packets: int(sysfs_net_read(ifname, 'statistics/rx_packets')) ?? 0
+	};
+}
+
+/* Deterministic hex parser, independent of ucode int()/hex() semantics */
+const hexdig = {
+	'0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7,
+	'8': 8, '9': 9, 'a': 10, 'b': 11, 'c': 12, 'd': 13, 'e': 14, 'f': 15
+};
+
+function hexval(s) {
+	s = lc(trim(s));
+
+	if (length(s) > 2 && substr(s, 0, 2) == '0x')
+		s = substr(s, 2);
+
+	if (!length(s))
+		return null;
+
+	let v = 0;
+
+	for (let i = 0; i < length(s); i++) {
+		const d = hexdig[substr(s, i, 1)];
+
+		if (d == null)
+			return null;
+
+		v = v * 16 + d;
+	}
+
+	return v;
+}
+
+function sysfs_net_read_bridge(ifname) {
+	const port_no_raw = sysfs_net_read(ifname, 'brport/port_no');
+
+	if (!length(port_no_raw))
+		return null;
+
+	/* kernel prints bridge port number as hex, e.g. "0x3" */
+	const port_no = hexval(port_no_raw) ?? 0;
+
+	if (port_no == 0)
+		return null;
+
+	const b_path = readlink(`${sysfs_net_root}/${ifname}/brport/bridge`);
+
+	if (!b_path)
+		return null;
+
+	return { port: port_no, ifname: basename(b_path) };
+}
+
+const type_patterns = {
+	copper:    [ /^eth\d+/, /^en[a-z]\d+[a-z]\d+/, /^sw\d+p\d+/ ],
+	usb_rndis: [ /^usb\d+/ ],
+	usb_stick: [ /^wwan\d+/, /^ww[a-z]\d+[a-z]\d+/ ],
+	ppp:       [ /^ppp\d+/ ],
+	tunnel:    [ /^tun\d+/, /^tap\d+/, /^wg\d+/ ],
+	wifi:      [ /^wlan\d+/, /^wl[a-z]\d+[a-z]\d+/ ]
+};
+
+function type_autodetect(ifname) {
+	for (let t in type_patterns)
+		for (let re in type_patterns[t])
+			if (match(ifname, re))
+				return t;
+
+	/* default type is 'copper' */
+	return 'copper';
+}
+
+const known_types = [
+	'auto', 'copper', 'fixed', 'usb', /* deprecated */
+	'usb_stick', 'usb_rndis', 'usb_2g', 'usb_3g', 'usb_4g',
+	'usb_wifi', 'wifi', 'vpn', 'tunnel', 'ppp', 'gprs', 'sfp'
+];
+
+/* ucode's index() may return null/undefined on miss; use an explicit search */
+function contains(list, val) {
+	for (let i in list)
+		if (i == val)
+			return true;
+
+	return false;
+}
+
+function normalize_type(t, ifname) {
+	if (!contains(known_types, t))
+		t = 'auto';
+
+	if (t == 'auto')
+		t = type_autodetect(ifname);
+	else if (t == 'usb')
+		t = 'usb_rndis';
+	else if (t == 'usb_2g' || t == 'usb_3g' || t == 'usb_4g')
+		t = 'usb_stick';
+	else if (t == 'usb_wifi')
+		t = 'wifi';
+	else if (t == 'vpn')
+		t = 'tunnel';
+
+	return t;
+}
+
+/* Physical port labels/roles from /etc/board.json (DSA: lan1, wan2, ...) */
+function get_board_labels() {
+	const labels = {};
+	const fd = open('/etc/board.json');
+	const raw = fd ? fd.read('all') : null;
+	const board = (raw != null) ? (json(raw) ?? {}) : {};
+
+	fd?.close();
+
+	for (let role in [ 'lan', 'wan' ]) {
+		const net = board?.network?.[role];
+
+		if (!net)
+			continue;
+
+		if (type(net.ports) == 'array') {
+			for (let p in net.ports) {
+				const name = (type(p) == 'object') ? p.name : p;
+				const label = (type(p) == 'object') ? p.label : null;
+
+				if (name && !labels[name])
+					labels[name] = { role: role, label: label };
+			}
+		}
+		else if (type(net.device) == 'string' && !labels[net.device]) {
+			labels[net.device] = { role: role, label: null };
+		}
+	}
+
+	return labels;
+}
+
+/* ifname -> { netname, wifiname, fwzone, fwzone_sid } maps */
+function get_network_maps(ub, ctx) {
+	const netlist = {}, brlist = {};
+	const zone_by_net = {};
+	const wifi_map = {};
+
+	ctx.foreach('firewall', 'zone', (s) => {
+		const nets = (type(s.network) == 'array')
+			? s.network
+			: (s.network ? split(s.network, /[ \t]+/) : []);
+
+		for (let n in nets) {
+			if (n && !zone_by_net[n])
+				zone_by_net[n] = { name: s.name ?? n, sid: s['.name'] };
+		}
+	});
+
+	ctx.foreach('wireless', 'wifi-iface', (s) => {
+		const names = (type(s.ifname) == 'array')
+			? s.ifname
+			: (s.ifname ? split(s.ifname, /[ \t]+/) : []);
+
+		for (let n in names)
+			if (n && !wifi_map[n])
+				wifi_map[n] = s['.name'];
+	});
+
+	if (ub) {
+		const wst = ub.call('network.wireless', 'status');
+
+		if (wst) {
+			for (let radio in wst) {
+				/* array iteration yields the interface objects themselves */
+				for (let section in (wst[radio].interfaces ?? [])) {
+					const secname = section?.section;
+
+					for (let ifn in (section?.ifnames ?? []))
+						if (ifn && !wifi_map[ifn])
+							wifi_map[ifn] = secname;
+				}
+			}
+		}
+	}
+
+	if (ub) {
+		const dump = ub.call('network.interface', 'dump');
+
+		/* ucode for-in over an array yields the values themselves */
+		for (let ifc in (dump?.interface ?? [])) {
+			const dev = ifc?.device;
+
+			if (!dev || netlist[dev] || brlist[dev])
+				continue;
+
+				const entry = {
+					netname: ifc.interface,
+					wifiname: wifi_map[dev] ?? null,
+					fwzone: zone_by_net[ifc.interface]?.name ?? null,
+					fwzone_sid: zone_by_net[ifc.interface]?.sid ?? null
+				};
+
+			if (access(`${sysfs_net_root}/${dev}/bridge`))
+				brlist[dev] = entry;
+			else
+				netlist[dev] = entry;
+		}
+	}
+
+	return [ netlist, brlist ];
+}
+
+const methods = {
+	getPortsInfo: {
+		call: function(request) {
+			const ctx = cursor();
+			const ub = connect();
+			const maps = get_network_maps(ub, ctx);
+			const netlist = maps[0];
+			const brlist = maps[1];
+			const board_labels = get_board_labels();
+
+			const ports = { data: [], count: 0 };
+
+			ctx.foreach('luci_netports', 'port', (s) => {
+				if (s.disable == '1' || s.disable == 'true' || s.disable == 'on')
+					return true;
+
+				const ifname = s.ifname;
+
+				if (!ifname || !access(`${sysfs_net_root}/${ifname}/ifindex`))
+					return true;
+
+				const t = normalize_type(s.type, ifname);
+
+				/* Authoritative live state from netifd via ubus */
+				const dev_state = ub
+					? ub.call('network.device', 'status', { name: ifname })
+					: null;
+
+				let hwaddr = sysfs_net_read(ifname, 'address') || '';
+				let carrier = int(sysfs_net_read(ifname, 'carrier')) ?? 0;
+				let operstate = sysfs_net_read(ifname, 'operstate') || 'unknown';
+				let adminstate = 'down';
+				let duplex = null;
+				let speed = 0;
+				let stats = sysfs_net_read_stats(ifname);
+
+				if (dev_state) {
+					if (dev_state.up)
+						adminstate = 'up';
+
+					if (dev_state.carrier)
+						carrier = 1;
+
+					if (dev_state.macaddr)
+						hwaddr = dev_state.macaddr;
+
+					if (dev_state.statistics) {
+						stats = {
+							tx_bytes:   dev_state.statistics.tx_bytes ?? 0,
+							tx_packets: dev_state.statistics.tx_packets ?? 0,
+							rx_bytes:   dev_state.statistics.rx_bytes ?? 0,
+							rx_packets: dev_state.statistics.rx_packets ?? 0
+						};
+					}
+				}
+				else {
+					/* sysfs fallback: IFF_UP flag is bit 0 of flags (0x1003) */
+					const f = hexval(sysfs_net_read(ifname, 'flags')) ?? 0;
+
+					adminstate = ((f % 2) == 1) ? 'up' : 'down';
+				}
+
+				if (carrier > 0) {
+					/* netifd link_duplex is a boolean (true = full duplex) */
+					if (dev_state) {
+						if (type(dev_state.link_duplex) == 'bool')
+							duplex = dev_state.link_duplex ? 'full' : 'half';
+
+						if (dev_state.link_speed > 0)
+							speed = dev_state.link_speed;
+					}
+
+					if (!duplex) {
+						const d = sysfs_net_read(ifname, 'duplex');
+
+						duplex = (d == 'full' || d == 'half') ? d : null;
+					}
+
+					if (speed <= 0) {
+						speed = int(sysfs_net_read(ifname, 'speed')) ?? 0;
+
+						if (speed < 0)
+							speed = 0;
+					}
+				}
+
+				const bridge = sysfs_net_read_bridge(ifname);
+				const blabel = board_labels[ifname];
+
+				const port = {
+					id: s['.name'],
+					ifname: ifname,
+					type: t,
+					name: s.name || ifname,
+					label: blabel?.label ?? null,
+					role: blabel?.role ?? null,
+					hwaddr: hwaddr,
+					carrier: carrier,
+					operstate: operstate,
+					adminstate: adminstate,
+					ntm: netlist[ifname] ?? null,
+					ntm_bridge: bridge ? (brlist[bridge.ifname] ?? null) : null,
+					bridge: bridge,
+					stats: stats
+				};
+
+				if (carrier > 0) {
+					if (duplex)
+						port.duplex = duplex;
+
+					if (speed > 0)
+						port.speed = speed;
+				}
+
+				push(ports.data, port);
+				ports.count++;
+
+				return true;
+			});
+
+			return ports;
+		}
+	}
+};
+
+return { netports: methods };

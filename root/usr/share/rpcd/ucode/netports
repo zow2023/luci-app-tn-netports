@@ -87,7 +87,7 @@ const type_patterns = {
 	usb_stick: [ /^wwan\d+/, /^ww[a-z]\d+[a-z]\d+/ ],
 	ppp:       [ /^ppp\d+/ ],
 	tunnel:    [ /^tun\d+/, /^tap\d+/, /^wg\d+/ ],
-	wifi:      [ /^wlan\d+/, /^wl[a-z]\d+[a-z]\d+/ ]
+	wifi:      [ /^wlan\d+/, /^wl\d+/, /^phy\d+/, /^wl[a-z]\d+[a-z]\d+/ ]
 };
 
 function type_autodetect(ifname) {
@@ -237,7 +237,7 @@ function get_network_maps(ub, ctx) {
 		}
 	}
 
-	return [ netlist, brlist ];
+	return [ netlist, brlist, wifi_map ];
 }
 
 const methods = {
@@ -248,6 +248,7 @@ const methods = {
 			const maps = get_network_maps(ub, ctx);
 			const netlist = maps[0];
 			const brlist = maps[1];
+            const wmap = maps[2];
 			const board_labels = get_board_labels();
 
 			const ports = { data: [], count: 0 };
@@ -261,7 +262,15 @@ const methods = {
 				if (!ifname || !access(`${sysfs_net_root}/${ifname}/ifindex`))
 					return true;
 
-				const t = normalize_type(s.type, ifname);
+				const t0 = normalize_type(s.type, ifname);
+
+				/* User-configured type has priority; otherwise resolve via
+				 * wireless config lookup (covers wl0-ap0 / phy0-ap0 / wlanN
+				 * and any future mac80211 naming), falling back to the
+				 * regex table inside normalize_type(). */
+				const t = ((s.type == 'auto' || !s.type) && wmap[ifname] != null)
+					? 'wifi'
+					: t0;
 
 				/* Authoritative live state from netifd via ubus */
 				const dev_state = ub
